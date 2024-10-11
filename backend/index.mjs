@@ -1,18 +1,18 @@
 import express from 'express';
+import dotenv from 'dotenv';
 import multer from 'multer';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import pg from 'pg'; // Assuming you're using pg to interact with PostgreSQL
 import fs from 'fs';
-import shp from 'shpjs'; // For reading shapefiles
+import path from 'path';
+import shp from 'shpjs';
+import pg from 'pg';
+
+dotenv.config(); // Load environment variables from .env file
 
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 5000;
 
-// Configure PostgreSQL client (adjust to your PostgreSQL config)
-import dotenv from 'dotenv';
-dotenv.config();  // Load environment variables from .env file
-
+// PostgreSQL connection pool
+const { Pool } = pg;
 const pool = new Pool({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
@@ -21,7 +21,7 @@ const pool = new Pool({
   port: process.env.DB_PORT,
 });
 
-// Set up Multer for handling file uploads
+// Middleware to handle file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, 'uploads/');
@@ -30,90 +30,95 @@ const storage = multer.diskStorage({
     cb(null, file.originalname);
   },
 });
+
 const upload = multer({ storage });
 
-// Get the current directory for serving static files
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Upload shapefile route
+// Endpoint to upload a shapefile
 app.post('/upload', upload.single('shapefile'), async (req, res) => {
-  try {
-    const filePath = path.join(__dirname, 'uploads', req.file.filename);
-    const shapefileData = await fs.promises.readFile(filePath);
-    
-    // Convert shapefile to GeoJSON using shpjs
-    const geojson = await shp(shapefileData);
+  const filePath = path.join(__dirname, 'uploads', req.file.filename);
 
-    // Loop through the GeoJSON features and insert them into the database
+  try {
+    // Read the uploaded shapefile
+    const data = await shp.readFile(filePath);
+
+    // Log the extracted features
+    console.log("Extracted GeoJSON features:", data.features);
+
+    // Extract features and insert them into the PostgreSQL database
     const client = await pool.connect();
-    for (const feature of geojson.features) {
-      const { geometry, properties } = feature;
-      const geom = JSON.stringify(geometry); // Convert geometry to a string for PostGIS
-      const props = JSON.stringify(properties); // Convert properties to a JSON string
-      await client.query(
-        `INSERT INTO your_table_name (geom, properties) VALUES (ST_GeomFromGeoJSON($1), $2)`,
-        [geom, props]
-      );
-    }
+    await Promise.all(
+      data.features.map(async (feature) => {
+        const { geometry, properties } = feature;
+        const geom = JSON.stringify(geometry); // Store the geometry as JSON
+
+        await client.query(
+          'INSERT INTO your_table_name(geom, properties) VALUES (ST_GeomFromGeoJSON($1), $2)',
+          [geom, JSON.stringify(properties)]
+        );
+      })
+    );
 
     client.release();
-    res.sendStatus(200);
+    res.status(200).json({ message: 'Shapefile uploaded and data inserted successfully!' });
   } catch (error) {
-    console.error('Error processing shapefile:', error);
-    res.sendStatus(500);
+    console.error('Error uploading shapefile:', error);
+    res.status(500).json({ error: 'Error uploading shapefile' });
   }
 });
 
-// Fetch all points route
+// Endpoint to retrieve points from the database
 app.get('/points', async (req, res) => {
   try {
-    const client = await pool.connect();
-    const result = await client.query('SELECT ST_AsGeoJSON(geom), properties FROM your_table_name');
+    const result = await pool.query('SELECT * FROM your_table_name');
+    console.log("Retrieved points from the database:", result.rows); // Log retrieved points
+
+    // Filter out any null features
     const geojson = {
-      type: 'FeatureCollection',
-      features: result.rows.map((row) => ({
-        type: 'Feature',
-        geometry: JSON.parse(row.st_asgeojson),
-        properties: row.properties,
-      })),
+      type: "FeatureCollection",
+      features: result.rows
+        .filter(row => row.geom !== null) // Ensure geom is not null
+        .map(row => ({
+          type: "Feature",
+          geometry: JSON.parse(row.geom), // Parse the geometry
+          properties: row.properties,
+        })),
     };
-    client.release();
-    res.json(geojson);
+
+    res.status(200).json(geojson);
   } catch (error) {
-    console.error('Error fetching points:', error);
-    res.sendStatus(500);
+    console.error('Error retrieving points:', error);
+    res.status(500).json({ error: 'Error retrieving points' });
   }
 });
 
-// Fetch nearby points route
+// Endpoint for proximity search
 app.get('/points/nearby', async (req, res) => {
   const { lat, lon, radius } = req.query;
   try {
-    const client = await pool.connect();
-    const result = await client.query(
-      `SELECT ST_AsGeoJSON(geom), properties FROM your_table_name 
+    const result = await pool.query(
+      `SELECT ST_AsGeoJSON(geom) AS geom, properties 
+      FROM your_table_name 
       WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)`,
       [lon, lat, radius]
     );
+
     const geojson = {
-      type: 'FeatureCollection',
-      features: result.rows.map((row) => ({
-        type: 'Feature',
-        geometry: JSON.parse(row.st_asgeojson),
+      type: "FeatureCollection",
+      features: result.rows.map(row => ({
+        type: "Feature",
+        geometry: JSON.parse(row.geom), // Parse the geometry
         properties: row.properties,
       })),
     };
-    client.release();
-    res.json(geojson);
+
+    res.status(200).json(geojson);
   } catch (error) {
     console.error('Error fetching nearby points:', error);
-    res.sendStatus(500);
+    res.status(500).json({ error: 'Error fetching nearby points' });
   }
 });
 
+// Start the server
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
