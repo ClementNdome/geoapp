@@ -11,6 +11,7 @@ Git
 ---
 git clone https://github.com/ClementNdome/geoapp.git
 cd geoapp
+-
   cd backend
   npm install
   cd ../frontend
